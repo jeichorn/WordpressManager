@@ -1,0 +1,272 @@
+#!/usr/bin/php
+<?php
+
+if (empty($argv[1]) || empty($argv[2]))
+{
+    echo "WordpressManager update sitename\nor\nWordpressManager update all\n";
+    exit(1);
+}
+
+$HOME = getenv('HOME');
+$action = $argv[1];
+$config = require $HOME.'/WordpressManagerConfig/config.php';
+if ($argv[2] == 'all')
+{
+    $sites = $config['sites'];
+}
+else
+{
+    $sites = [$argv[2]];
+}
+
+// create a directory to store logs in
+if (!file_exists("$HOME/deploy-logs/"))
+{
+    mkdir("$HOME/deploy-logs/", 0777, true);
+}
+
+// collect any output for logging and spew to the screen
+ob_start(function($output) { echo $output; return $output; }, 128);
+
+
+// task loop
+try
+{
+    foreach($sites as $site => $configName)
+    {
+        $start = microtime(true);
+        echo date('Y-m-d H:i:s T')."  Updating $site using $configName\n";
+
+        if (empty($config['sites'][$site]))
+        {
+            throw new Exception("$site not listed in config");
+        }
+
+        $dir = $HOME."/sites/$site";
+        if (!file_exists($dir))
+        {
+            throw new Exception("Can't find $site as $dir");
+        }
+
+        $deployPath = realpath($dir).'/';
+
+        $siteConfig = $config['configs'][$configName];
+
+
+        echo date('Y-m-d H:i:s T')." Copy start\n";
+        foreach($siteConfig['copy'] as $source => $target)
+        {
+            $source = str_replace('~', $HOME, $source);
+            if (!file_exists($source))
+            {
+                echo "$source doesn't exist\n";
+                exit(1);
+            }
+
+            $target = $deployPath.$target.'/'.basename($source);
+
+            $cmd = "rsync -rv $source $target";
+            runcmd($cmd);
+        }
+        echo date('Y-m-d H:i:s T')." Copy end\n";
+
+
+        // perform wordpress operations
+        chdir($deployPath);
+
+        // put wordpress into maintenance mode
+        $ts = time();
+        file_put_contents("$deployPath/.maintenance","<?php \$upgrading = $ts; ?>");
+
+        // handle plugins
+        echo date('Y-m-d H:i:s T')." Plugin Update Start\n";
+        foreach($siteConfig['plugins'] as $plugin => $action)
+        {
+            $cmds = [];
+            $url = '';
+            if (is_array($action))
+            {
+                    $url = $action['url'];
+                    $action =  $action['action'];
+            }
+            switch($action)
+            {
+                case 'remove':
+                    if (plugin_exists($plugin))
+                    {
+                        $cmds[] = "wp plugin deactivate $plugin";
+                        $cmds[] = "wp plugin delete $plugin";
+                    }
+                    break;
+                case 'install':
+                    if (!plugin_exists($plugin))
+                    {
+                        if (!empty($url))
+                            $cmds[] = "wp plugin install $url";
+                        else
+                            $cmds[] = "wp plugin install $plugin";
+                    }
+                    if (!plugin_active($plugin))
+                        $cmds[] = "wp plugin activate $plugin";
+                    break;
+                default:
+                    $cmds[] = "wp plugin $action $plugin $url";
+            }
+
+            foreach($cmds as $cmd)
+            {
+                runcmd($cmd);
+            }
+        }
+        echo date('Y-m-d H:i:s T')." Plugin Update End\n";
+
+        echo date('Y-m-d H:i:s T')." Theme Update Start\n";
+        $cmd = "wp theme activate {$siteConfig['theme']}";
+        runcmd($cmd);
+        echo date('Y-m-d H:i:s T')." Theme Update Complete\n\n";
+
+
+        echo date('Y-m-d H:i:s T')." Options Update Start\n";
+        foreach($siteConfig['options'] as $name => $option)
+        {
+            $value = $format = $autoload = '';
+            if (!empty($option['value']))
+            {
+                $value = escapeshellarg(json_encode($option['value']));
+                $format = "--format=json";
+            }
+
+            if (!empty($option['autoload']))
+                $autoload = "--autoload=yes";
+
+            if (!empty($option['format']))
+                $format = "--format={$option['format']}";
+
+            $action = $option['action'];
+
+            $name = escapeshellarg($name);
+
+            $cmd = "wp option $action $name $value $format $autoload";
+            if ($action == 'add')
+            {
+                $cmd = "wp option get $name";
+                $val = exec($cmd);
+                if (empty($val))
+                    $cmd = "wp option $action $name $value $format $autoload";
+                else
+                    $cmd = '';
+            }
+
+            if ($cmd)
+                runcmd($cmd);
+        }
+        echo date('Y-m-d H:i:s T')." Options Update Complete\n\n";
+
+        echo date('Y-m-d H:i:s T')." Deleting Posts Start\n";
+        foreach($siteConfig['posts_to_delete'] as $post)
+        {
+            $cmd = "wp db query ".escapeshellarg("delete from wp_posts where id = $post[id] and post_title = '".addslashes($post['title'])."'");
+            runcmd($cmd);
+        }
+        echo date('Y-m-d H:i:s T')." Deleting Posts End\n";
+
+        echo date('Y-m-d H:i:s T')." Import Wxr Start\n";
+        if (count($siteConfig['import']))
+        {
+            if (!plugin_active('wordpress-importer'))
+            {
+                runcmd('wp plugin install wordpress-importer --activate');
+            }
+
+        }
+
+        foreach($siteConfig['import'] as $file)
+        {
+            $cmd = "wp import $file --authors=create";
+            runcmd($cmd);
+        }
+        echo date('Y-m-d H:i:s T')." Import Wxr End\n";
+
+        echo date('Y-m-d H:i:s T')." Create Users Start\n";
+        $users = current_users();
+        foreach($siteConfig['users'] as $userlogin => $user)
+        {
+            if (empty($users[$userlogin]))
+            {
+                $cmd = "wp user create $userlogin $user[email] --role=$user[role] --user_pass=$user[password] --display_name=$user[display_name]";
+            }
+        }
+        echo date('Y-m-d H:i:s T')." Create Users End\n";
+
+        // disable maintenance
+        unlink("$deployPath/.maintenance");
+        $time = round(microtime(true)-$start, 2);
+        echo date('Y-m-d H:i:s T')."  Deployment of $site completed in $time seconds\n";
+    }
+}
+catch(Exception $e)
+{
+    echo date('Y-m-d H:i:s T')." Deployment failed\n";
+}
+
+
+
+// log all output
+$log = ob_get_contents();
+file_put_contents("$HOME/deploy-logs/".date('Y-m-dHisT').".log", $log);
+
+// very simple hackish helper functions we could do something fancier, but this is
+// as simple as possible for now
+function runcmd($cmd)
+{
+    echo $cmd."\n";
+    passthru($cmd, $code);
+    if ($code != 0)
+    {
+        echo "COMMAND FAILED with code $code\n";
+        throw new Exception('cmd failed');
+    }
+}
+
+function plugin_exists($plugin)
+{
+    $data = plugin_data();
+    foreach($data as $datum)
+    {
+        if ($datum->name == $plugin)
+            return true;
+    }
+    return false;
+}
+
+function plugin_active($plugin)
+{
+    $data = plugin_data();
+    foreach($data as $datum)
+    {
+        if ($datum->name == $plugin && $datum->status == 'active')
+            return true;
+    }
+    return false;
+
+}
+
+$plugin_data = null;
+function plugin_data()
+{
+    global $plugin_data;
+    if (empty($plugin_data))
+    {
+            $data = `wp plugin list --format=json`;
+            $plugin_data = json_decode(trim($data));
+
+    }
+    return $plugin_data;
+}
+
+function current_users()
+{
+    $data = `wp user list --format=json`;
+    return json_decode(trim($data));
+}
+?>
